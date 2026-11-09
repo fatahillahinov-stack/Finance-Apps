@@ -1,6 +1,6 @@
 streamlit
 pandas
 plotly
-groq
-python-dotenv
 openpyxl
+python-dotenv
+google-genai
