@@ -1,10 +1,12 @@
-import streamlit as st
+import os
+import hashlib
+
 import pandas as pd
 import plotly.express as px
 import requests
-import os
-
+import streamlit as st
 from dotenv import load_dotenv
+
 
 # =========================================================
 # 1. PAGE CONFIGURATION
@@ -13,11 +15,12 @@ from dotenv import load_dotenv
 st.set_page_config(
     page_title="Budget vs. Actuals AI",
     page_icon="📊",
-    layout="wide"
+    layout="wide",
 )
 
+
 # =========================================================
-# 2. CONFIGURATION AND API KEY
+# 2. CONFIGURATION
 # =========================================================
 
 load_dotenv()
@@ -28,37 +31,103 @@ try:
     if "OPENROUTER_API_KEY" in st.secrets:
         OPENROUTER_API_KEY = st.secrets["OPENROUTER_API_KEY"]
 except Exception:
+    # st.secrets may not exist when running locally.
     pass
 
 MODEL_NAME = "deepseek/deepseek-v4.1-flash"
-
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
+SYSTEM_PROMPT = """
+You are an expert Senior Financial Analyst, Management Accountant,
+and Financial Controller.
+
+Your task is to perform financial analysis, not merely summarize data.
+
+ANALYTICAL FRAMEWORK
+
+1. DATA UNDERSTANDING
+   - Identify expense, revenue, profit, and subtotal accounts.
+   - Identify unusual, negative, missing, or inconsistent values.
+   - Do not assume every row is an independent transaction.
+
+2. VARIANCE ANALYSIS
+   - Analyze Budget versus Actual.
+   - Identify material favorable and unfavorable variances.
+   - Support findings with the relevant figures and percentages.
+   - Explain the financial significance of each finding.
+
+3. FINANCIAL PERFORMANCE
+   - Assess budget execution.
+   - Analyze revenue, expenses, and profitability separately.
+   - Explain relationships between accounts only when supported
+     by the supplied figures.
+
+4. RISK AND ANOMALY IDENTIFICATION
+   - Identify accounts requiring further investigation.
+   - Distinguish unusual values from confirmed errors.
+   - Do not label a value as fraudulent or erroneous without evidence.
+
+5. ROOT-CAUSE ANALYSIS
+   - Separate facts observed in the dataset from possible explanations.
+   - Do not invent causes that cannot be established from the data.
+   - State what additional information is needed to verify a hypothesis.
+
+6. RECOMMENDATIONS
+   - Give practical, prioritized recommendations.
+   - Link each recommendation to an observed finding.
+   - Explain what additional evidence should be reviewed.
+
+IMPORTANT ACCOUNTING RULES
+
+- For expense accounts, Actual greater than Budget generally indicates
+  an unfavorable overspend, subject to the account's nature.
+- For revenue accounts, Actual below Budget generally indicates
+  an unfavorable shortfall.
+- For profit accounts, interpret the movement according to the
+  relevant performance measure.
+- A positive or negative variance does not have the same meaning
+  for every account type.
+- Do not add detail accounts and their subtotals together.
+- If account classifications are not provided, state the assumptions.
+- Do not treat a raw sum of mixed detail and subtotal accounts as a
+  reliable grand total without checking the account hierarchy.
+- Identify missing currency, period, and accounting context.
+
+RESPONSE STYLE
+
+- Respond in the same language as the user's question.
+- Answer the specific question first.
+- Use professional accounting terminology.
+- Use numerical evidence and tables where useful.
+- Provide interpretation and implications, not just descriptions.
+- Be precise, objective, and evidence-based.
+"""
+
+
 # =========================================================
-# 3. OPENROUTER API FUNCTION
+# 3. OPENROUTER / DEEPSEEK FUNCTION
 # =========================================================
 
 def call_deepseek(messages, enable_reasoning=True):
+    """Send chat messages to DeepSeek through OpenRouter."""
 
     if not OPENROUTER_API_KEY:
         raise ValueError(
             "OPENROUTER_API_KEY tidak ditemukan. "
-            "Silakan konfigurasi Streamlit Secrets."
+            "Tambahkan API Key pada Streamlit Secrets atau file .env."
         )
 
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
-        "X-Title": "Budget vs. Actuals AI"
+        "X-Title": "Budget vs. Actuals AI",
     }
 
     payload = {
         "model": MODEL_NAME,
         "messages": messages,
-        "reasoning": {
-            "enabled": enable_reasoning
-        },
-        "max_tokens": 4000
+        "reasoning": {"enabled": enable_reasoning},
+        "max_tokens": 4000,
     }
 
     try:
@@ -66,54 +135,66 @@ def call_deepseek(messages, enable_reasoning=True):
             API_URL,
             headers=headers,
             json=payload,
-            timeout=180
+            timeout=180,
+        )
+    except requests.exceptions.Timeout as exc:
+        raise RuntimeError(
+            "Request ke OpenRouter melewati batas waktu. "
+            "Silakan coba kembali."
+        ) from exc
+    except requests.exceptions.ConnectionError as exc:
+        raise RuntimeError(
+            "Tidak dapat terhubung ke OpenRouter. "
+            "Periksa koneksi internet atau status layanan."
+        ) from exc
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(f"Kesalahan request OpenRouter: {exc}") from exc
+
+    if response.status_code != 200:
+        try:
+            error_data = response.json()
+            error_message = error_data.get("error", {}).get(
+                "message", response.text
+            )
+        except (ValueError, AttributeError):
+            error_message = response.text
+
+        raise RuntimeError(
+            f"OpenRouter API Error ({response.status_code}): "
+            f"{error_message}"
         )
 
-        if response.status_code != 200:
-            try:
-                error_data = response.json()
-                error_message = error_data.get(
-                    "error", {}
-                ).get("message", response.text)
-            except Exception:
-                error_message = response.text
-
-            raise RuntimeError(
-                f"OpenRouter API Error "
-                f"({response.status_code}): {error_message}"
-            )
-
+    try:
         result = response.json()
+    except ValueError as exc:
+        raise RuntimeError("OpenRouter mengembalikan respons JSON tidak valid.") from exc
 
-        if not result.get("choices"):
-            raise RuntimeError(
-                "API tidak mengembalikan pilihan jawaban."
-            )
+    choices = result.get("choices", [])
+    if not choices:
+        raise RuntimeError("API tidak mengembalikan pilihan jawaban.")
 
-        assistant_message = result["choices"][0]["message"]
+    assistant_message = choices[0].get("message", {})
+    answer = assistant_message.get("content")
 
-        answer = assistant_message.get("content")
-
-        if not answer:
-            raise RuntimeError(
-                "Model tidak menghasilkan teks jawaban."
-            )
-
-        return answer, assistant_message
-
-    except requests.exceptions.Timeout:
-        raise RuntimeError(
-            "Request timeout. Silakan coba kembali."
+    if isinstance(answer, list):
+        # Handle providers that return content as a list of text blocks.
+        answer = "\n".join(
+            item.get("text", "")
+            for item in answer
+            if isinstance(item, dict)
         )
 
-    except requests.exceptions.ConnectionError:
+    if not answer or not str(answer).strip():
         raise RuntimeError(
-            "Tidak dapat terhubung ke OpenRouter."
+            "Model tidak menghasilkan teks jawaban. "
+            "Periksa respons model atau pengaturan token."
         )
+
+    return str(answer), assistant_message
 
 
 # =========================================================
-# 4. INITIALIZE SESSION STATE
+# 4. SESSION STATE
 # =========================================================
 
 if "chat_history" not in st.session_state:
@@ -131,16 +212,11 @@ if "dataset_signature" not in st.session_state:
 # =========================================================
 
 st.title("📊 Budget vs. Actuals AI")
+st.subheader("Variance Analysis & Financial Commentary")
 
-st.subheader(
-    "Variance Analysis & Financial Commentary"
-)
-
-st.markdown(
-    """
-    Upload your Budget vs. Actuals dataset and generate
-    financial insights using DeepSeek V4.1 Flash.
-    """
+st.write(
+    "Upload your Budget vs. Actuals dataset and generate "
+    "financial insights using DeepSeek V4.1 Flash."
 )
 
 st.caption(
@@ -150,7 +226,7 @@ st.caption(
 if not OPENROUTER_API_KEY:
     st.error(
         "OPENROUTER_API_KEY belum dikonfigurasi. "
-        "Silakan tambahkan API Key pada Streamlit Secrets."
+        "Tambahkan API Key pada Streamlit Secrets."
     )
     st.stop()
 
@@ -161,17 +237,18 @@ if not OPENROUTER_API_KEY:
 
 uploaded_file = st.file_uploader(
     "📂 Upload your financial dataset (Excel)",
-    type=["xlsx"]
+    type=["xlsx"],
 )
 
 
-if uploaded_file:
-
+if uploaded_file is not None:
     try:
-
-        # =================================================
+        # -------------------------------------------------
         # 7. READ AND VALIDATE DATA
-        # =================================================
+        # -------------------------------------------------
+
+        file_bytes = uploaded_file.getvalue()
+        file_signature = hashlib.md5(file_bytes).hexdigest()
 
         df = pd.read_excel(uploaded_file)
 
@@ -179,67 +256,44 @@ if uploaded_file:
             st.error("Dataset tidak memiliki data.")
             st.stop()
 
-        required_columns = [
-            "Category",
-            "Budget",
-            "Actual"
-        ]
-
+        required_columns = ["Category", "Budget", "Actual"]
         missing_columns = [
-            col for col in required_columns
-            if col not in df.columns
+            column for column in required_columns
+            if column not in df.columns
         ]
 
         if missing_columns:
             st.error(
-                f"Kolom berikut tidak ditemukan: "
-                f"{', '.join(missing_columns)}"
+                "Kolom berikut tidak ditemukan: "
+                + ", ".join(missing_columns)
             )
             st.stop()
 
         df = df.copy()
-
         df["Category"] = (
             df["Category"].fillna("Uncategorized").astype(str)
         )
-
-        df["Budget"] = pd.to_numeric(
-            df["Budget"], errors="coerce"
-        )
-
-        df["Actual"] = pd.to_numeric(
-            df["Actual"], errors="coerce"
-        )
+        df["Budget"] = pd.to_numeric(df["Budget"], errors="coerce")
+        df["Actual"] = pd.to_numeric(df["Actual"], errors="coerce")
 
         if df[["Budget", "Actual"]].isna().any().any():
             st.error(
-                "Budget atau Actual mengandung nilai "
-                "kosong atau bukan angka. Periksa dataset."
+                "Kolom Budget atau Actual mengandung nilai kosong "
+                "atau bukan angka. Periksa dataset."
             )
             st.stop()
 
-        # =================================================
-        # 8. DATASET SIGNATURE AND CHAT RESET
-        # =================================================
-
-        signature = (
-            uploaded_file.name,
-            uploaded_file.size
-        )
-
-        if st.session_state.dataset_signature != signature:
-
-            st.session_state.dataset_signature = signature
+        # Reset AI results when a different file is uploaded.
+        if st.session_state.dataset_signature != file_signature:
+            st.session_state.dataset_signature = file_signature
             st.session_state.chat_history = []
             st.session_state.analysis_result = None
 
-        # =================================================
-        # 9. VARIANCE CALCULATION
-        # =================================================
+        # -------------------------------------------------
+        # 8. VARIANCE CALCULATION
+        # -------------------------------------------------
 
-        df["Variance"] = (
-            df["Actual"] - df["Budget"]
-        )
+        df["Variance"] = df["Actual"] - df["Budget"]
 
         df["Variance %"] = (
             df["Variance"]
@@ -247,20 +301,21 @@ if uploaded_file:
         ) * 100
 
         df["Variance Status"] = df["Variance"].apply(
-            lambda x:
-                "Overspending" if x > 0
-                else "Underspending" if x < 0
+            lambda value: (
+                "Overspending" if value > 0
+                else "Underspending" if value < 0
                 else "On Budget"
+            )
         )
 
-        # =================================================
-        # 10. AGGREGATED DATA
-        # =================================================
+        # -------------------------------------------------
+        # 9. AGGREGATION AND KPI
+        # -------------------------------------------------
 
         chart_df = (
-            df.groupby("Category", as_index=False)
-            [["Budget", "Actual", "Variance"]]
-            .sum()
+            df.groupby("Category", as_index=False)[
+                ["Budget", "Actual", "Variance"]
+            ].sum()
         )
 
         chart_df["Variance %"] = (
@@ -270,47 +325,43 @@ if uploaded_file:
 
         total_budget = df["Budget"].sum()
         total_actual = df["Actual"].sum()
-
-        total_variance = (
-            total_actual - total_budget
-        )
+        total_variance = total_actual - total_budget
 
         total_variance_pct = (
             (total_variance / total_budget) * 100
-            if total_budget != 0 else None
+            if total_budget != 0
+            else None
         )
 
-        # =================================================
-        # 11. DATA PREVIEW
-        # =================================================
+        execution_rate = (
+            (total_actual / total_budget) * 100
+            if total_budget != 0
+            else None
+        )
+
+        # -------------------------------------------------
+        # 10. DATA PREVIEW
+        # -------------------------------------------------
 
         st.divider()
-
         st.subheader("📋 Financial Data Preview")
 
         st.dataframe(
             df,
             use_container_width=True,
-            hide_index=True
+            hide_index=True,
         )
 
-        # =================================================
-        # 12. KPI DASHBOARD
-        # =================================================
+        # -------------------------------------------------
+        # 11. KPI DASHBOARD
+        # -------------------------------------------------
 
         st.subheader("📌 Financial Performance Indicators")
 
         col1, col2, col3, col4 = st.columns(4)
 
-        col1.metric(
-            "Total Budget",
-            f"{total_budget:,.2f}"
-        )
-
-        col2.metric(
-            "Total Actual",
-            f"{total_actual:,.2f}"
-        )
+        col1.metric("Total Budget", f"{total_budget:,.2f}")
+        col2.metric("Total Actual", f"{total_actual:,.2f}")
 
         col3.metric(
             "Total Variance",
@@ -320,29 +371,26 @@ if uploaded_file:
                 if total_variance_pct is not None
                 else None
             ),
-            delta_color="inverse"
+            delta_color="inverse",
         )
 
         col4.metric(
             "Execution Rate",
-            (
-                f"{(total_actual / total_budget) * 100:.2f}%"
-                if total_budget != 0 else "N/A"
-            )
+            f"{execution_rate:.2f}%"
+            if execution_rate is not None
+            else "N/A",
         )
 
-        # =================================================
-        # 13. VARIANCE ANALYSIS
-        # =================================================
+        # -------------------------------------------------
+        # 12. CHARTS
+        # -------------------------------------------------
 
         st.divider()
-
         st.subheader("📈 Budget vs. Actual Analysis")
 
-        col1, col2 = st.columns(2)
+        chart_col1, chart_col2 = st.columns(2)
 
-        with col1:
-
+        with chart_col1:
             fig_bar = px.bar(
                 chart_df,
                 x="Category",
@@ -350,322 +398,195 @@ if uploaded_file:
                 color="Variance",
                 title="Budget Variance by Category",
                 text_auto=".2s",
-                color_continuous_scale=[
-                    "red", "yellow", "green"
-                ]
+                color_continuous_scale=["red", "yellow", "green"],
             )
+            st.plotly_chart(fig_bar, use_container_width=True)
 
-            st.plotly_chart(
-                fig_bar,
-                use_container_width=True
-            )
-
-        with col2:
-
+        with chart_col2:
             fig_line = px.line(
                 chart_df,
                 x="Category",
                 y=["Budget", "Actual"],
                 markers=True,
-                title="Budget vs. Actual Performance"
+                title="Budget vs. Actual Performance",
             )
+            st.plotly_chart(fig_line, use_container_width=True)
 
-            st.plotly_chart(
-                fig_line,
-                use_container_width=True
-            )
+        # -------------------------------------------------
+        # 13. FINANCIAL DATA CONTEXT
+        # -------------------------------------------------
 
-        # =================================================
-        # 14. FINANCIAL ANALYSIS CONTEXT
-        # =================================================
-
-        financial_summary = chart_df.to_string(
-            index=False
-        )
-
-      
-system_prompt = """
-You are an expert Senior Financial Analyst,
-Management Accountant, and Financial Controller.
-
-Your task is NOT merely to summarize financial data.
-Your primary responsibility is to perform
-DEEP FINANCIAL ANALYSIS and provide actionable insights.
-
-You must operate using the following analytical framework:
-
-1. DATA UNDERSTANDING
-   - Understand the financial accounts and categories.
-   - Identify expense, revenue, profit, and subtotal accounts.
-   - Identify unusual or inconsistent financial values.
-
-2. VARIANCE ANALYSIS
-   - Analyze Budget vs Actual.
-   - Identify the largest favorable and unfavorable variances.
-   - Calculate variance percentages where appropriate.
-   - Explain the financial significance of each variance.
-
-3. FINANCIAL PERFORMANCE ANALYSIS
-   - Assess budget execution.
-   - Evaluate spending efficiency.
-   - Analyze revenue and profitability performance.
-   - Identify significant financial trends.
-
-4. ANOMALY AND RISK DETECTION
-   - Identify unusual values and negative balances.
-   - Detect potentially abnormal financial movements.
-   - Identify accounts requiring further investigation.
-   - Distinguish actual anomalies from normal accounting treatments.
-
-5. ROOT CAUSE ANALYSIS
-   - Identify possible explanations for financial deviations.
-   - Distinguish verified facts from hypotheses.
-   - Never invent explanations unsupported by the dataset.
-
-6. RECOMMENDATIONS
-   - Provide practical recommendations.
-   - Prioritize issues based on financial materiality.
-   - Suggest additional data required for further investigation.
-
-ANALYTICAL RULES:
-
-- Do not merely repeat the dataset.
-- Do not provide a generic summary unless requested.
-- Always answer the specific question first.
-- Support conclusions with numerical evidence.
-- Explain the implications of significant variances.
-- Distinguish favorable and unfavorable variances.
-- For expenses, positive variance means overspending.
-- For revenue, interpret variance according to revenue performance.
-- For profit accounts, assess whether the movement is favorable.
-- Do not interpret subtotal accounts as independent transactions.
-- Do not double-count subtotals when calculating totals.
-- Identify missing information and data limitations.
-
-RESPONSE STYLE:
-
-- Respond in the same language as the user.
-- Use professional accounting terminology.
-- Use tables when they improve clarity.
-- Provide analytical conclusions, not just descriptions.
-- Be precise, objective, and evidence-based.
-"""
-
+        financial_summary = chart_df.to_string(index=False)
 
         data_context = f"""
-        FINANCIAL DATA:
+FINANCIAL DATA BY CATEGORY
 
-        {financial_summary}
+{financial_summary}
 
-        TOTAL BUDGET: {total_budget:,.2f}
-        TOTAL ACTUAL: {total_actual:,.2f}
-        TOTAL VARIANCE: {total_variance:,.2f}
+TOTAL BUDGET (raw sum of uploaded rows): {total_budget:,.2f}
+TOTAL ACTUAL (raw sum of uploaded rows): {total_actual:,.2f}
+TOTAL VARIANCE: {total_variance:,.2f}
+TOTAL VARIANCE PERCENTAGE:
+{total_variance_pct if total_variance_pct is not None else "N/A"}
 
-        TOTAL VARIANCE PERCENTAGE:
-        {total_variance_pct if total_variance_pct is not None else "N/A"}
+EXECUTION RATE:
+{execution_rate if execution_rate is not None else "N/A"}%
 
-        EXECUTION RATE:
-        {
-            (total_actual / total_budget) * 100
-            if total_budget != 0 else "N/A"
-        }
-        """
+IMPORTANT DATA LIMITATION:
+The uploaded data may contain detail accounts, revenue accounts,
+profit accounts, and subtotal accounts. The raw totals above are
+simple sums of uploaded rows and may double-count values if detail
+accounts and subtotals are both included. Verify the account hierarchy
+before treating these totals as consolidated financial totals.
+The currency and reporting period were not supplied unless stated
+in the uploaded dataset.
+"""
 
-        # =================================================
-        # 15. AI-POWERED FINANCIAL ANALYSIS
-        # =================================================
+        # -------------------------------------------------
+        # 14. AI-POWERED FINANCIAL ANALYSIS
+        # -------------------------------------------------
 
         st.divider()
-
         st.subheader("🤖 AI-Powered Financial Analysis")
 
         if st.button(
             "Generate AI Financial Analysis",
             type="primary",
-            use_container_width=True
+            use_container_width=True,
         ):
-
             analysis_prompt = f"""
-            Perform a comprehensive financial variance analysis.
+Perform a comprehensive financial variance analysis using
+the dataset below.
 
-            {data_context}
+{data_context}
 
-            Structure your analysis as follows:
+Present the analysis in this structure:
 
-            1. Executive Summary
-            2. Significant Budget Variances
-            3. Categories with Overspending
-            4. Categories with Underspending
-            5. Possible Causes of Variances
-            6. Financial Risks and Implications
-            7. Recommendations
+1. Executive Summary
+2. Significant Budget Variances
+3. Categories with Unfavorable Variances
+4. Categories with Favorable Variances
+5. Relationships between Revenue, Expenses, and Profit
+6. Financial Risks and Issues Requiring Investigation
+7. Recommendations and Follow-up Procedures
 
-            Use tables where appropriate.
-
-            Distinguish between facts established by the
-            dataset and possible causes requiring further
-            investigation.
-            """
+Do not merely repeat the data. Explain the financial meaning
+of the most material findings. Distinguish verified facts from
+possible explanations. Do not assume that all categories are
+expense accounts.
+"""
 
             with st.spinner(
                 "DeepSeek V4.1 Flash is analyzing financial data..."
             ):
-
                 try:
+                    analysis_messages = [
+                        {
+                            "role": "system",
+                            "content": SYSTEM_PROMPT,
+                        },
+                        {
+                            "role": "user",
+                            "content": analysis_prompt,
+                        },
+                    ]
 
-                    
-messages = [
-    {
-        "role": "system",
-        "content": system_prompt
-    },
-    {
-        "role": "system",
-        "content": f"""
-        FINANCIAL DATA CONTEXT:
-
-        {data_context}
-
-        IMPORTANT:
-        The dataset above is your primary source of evidence.
-
-        Analyze the dataset before answering.
-        Do not simply reproduce its contents.
-
-        Your response must address the user's specific question.
-        Provide numerical evidence and analytical interpretation
-        whenever relevant.
-        """
-    }
-] + history + [
-    {
-        "role": "user",
-        "content": user_query
-    }
-]
-                    answer, _ = call_deepseek(messages)
-
+                    answer, _ = call_deepseek(analysis_messages)
                     st.session_state.analysis_result = answer
 
-                except Exception as e:
-
-                    st.error(str(e))
+                except Exception as error:
+                    st.error(f"AI Analysis Error: {error}")
 
         if st.session_state.analysis_result:
+            st.markdown(st.session_state.analysis_result)
 
-            st.markdown(
-                st.session_state.analysis_result
-            )
-
-        # =================================================
-        # 16. AI CHAT INTERFACE
-        # =================================================
+        # -------------------------------------------------
+        # 15. AI CHAT
+        # -------------------------------------------------
 
         st.divider()
-
-        st.subheader(
-            "🗣️ Chat with AI About Financial Performance"
-        )
+        st.subheader("🗣️ Chat with AI About Financial Performance")
 
         st.caption(
-            "Ask questions about budget execution, "
-            "variance, financial risks, and recommendations."
+            "Ask questions about budget execution, variance, "
+            "financial risks, and recommendations."
         )
 
-        # Display conversation history
-
         for message in st.session_state.chat_history:
-
             with st.chat_message(message["role"]):
-
                 st.markdown(message["content"])
-
-        # Chat input
 
         user_query = st.chat_input(
             "Ask DeepSeek about your financial data..."
         )
 
         if user_query:
-
             with st.chat_message("user"):
-
                 st.markdown(user_query)
 
             with st.chat_message("assistant"):
-
-                with st.spinner(
-                    "DeepSeek is preparing your answer..."
-                ):
-
+                with st.spinner("DeepSeek is preparing your answer..."):
                     try:
+                        history = st.session_state.chat_history[-12:]
 
-                        history = (
-                            st.session_state.chat_history[-12:]
-                        )
-
-                        messages = [
+                        chat_messages = [
                             {
                                 "role": "system",
-                                "content": (
-                                    system_prompt +
-                                    "\n\n" +
-                                    data_context
-                                )
-                            }
+                                "content": SYSTEM_PROMPT,
+                            },
+                            {
+                                "role": "system",
+                                "content": data_context,
+                            },
                         ] + history + [
                             {
                                 "role": "user",
-                                "content": user_query
+                                "content": user_query,
                             }
                         ]
 
                         answer, assistant_message = call_deepseek(
-                            messages
+                            chat_messages
                         )
 
                         st.markdown(answer)
 
-                        # Preserve reasoning_details if returned.
-                        stored_message = {
+                        # Preserve provider reasoning metadata if supplied.
+                        stored_assistant_message = {
                             "role": "assistant",
-                            "content": answer
+                            "content": answer,
                         }
 
-                        if assistant_message.get(
+                        reasoning_details = assistant_message.get(
                             "reasoning_details"
-                        ):
-                            stored_message[
+                        )
+                        if reasoning_details is not None:
+                            stored_assistant_message[
                                 "reasoning_details"
-                            ] = assistant_message[
-                                "reasoning_details"
+                            ] = reasoning_details
+
+                        st.session_state.chat_history.extend(
+                            [
+                                {
+                                    "role": "user",
+                                    "content": user_query,
+                                },
+                                stored_assistant_message,
                             ]
+                        )
 
-                        st.session_state.chat_history.extend([
-                            {
-                                "role": "user",
-                                "content": user_query
-                            },
-                            stored_message
-                        ])
+                    except Exception as error:
+                        st.error(f"AI Chat Error: {error}")
 
-                    except Exception as e:
-
-                        st.error(str(e))
-
-    except Exception as e:
-
-        st.error(
-            f"Error processing uploaded file: {str(e)}"
-        )
+    except Exception as error:
+        st.error(f"Error processing uploaded file: {error}")
 
 
 # =========================================================
-# 17. FOOTER
+# 16. FOOTER
 # =========================================================
 
 st.divider()
-
 st.caption(
     "Budget vs. Actuals AI | Powered by DeepSeek V4.1 Flash "
     "via OpenRouter"
