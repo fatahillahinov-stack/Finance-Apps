@@ -6,11 +6,19 @@ from groq import Groq
 from dotenv import load_dotenv
 
 # Load API key securely
+# Load API key securely
 load_dotenv()
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_API_KEY = (
+    st.secrets.get("GROQ_API_KEY")
+    if "GROQ_API_KEY" in st.secrets
+    else os.getenv("GROQ_API_KEY")
+)
 
 if not GROQ_API_KEY:
-    st.error("🚨 API Key is missing! Set it in Streamlit Secrets or a .env file.")
+    st.error(
+        "🚨 Groq API Key is missing! "
+        "Set GROQ_API_KEY in Streamlit Secrets or a .env file."
+    )
     st.stop()
 
 # Streamlit App UI
