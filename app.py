@@ -201,12 +201,11 @@ if uploaded_file:
                 """
 
                 try:
-response = client.interactions.create(
-    model="gemini-3.8-flash",
-    input=prompt
-)
-
-st.markdown(response.output_text)
+                    response = client.interactions.create(
+                        model="gemini-3.8-flash",
+                        input=prompt
+                    )
+                    st.markdown(response.output_text)
 
                 except Exception as e:
                     st.error(f"Gemini API Error: {str(e)}")
