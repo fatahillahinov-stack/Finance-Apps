@@ -72,7 +72,7 @@ if uploaded_file:
             {"role": "system", "content": "You are an AI financial analyst providing variance analysis insights on budget vs. actuals."},
             {"role": "user", "content": f"Here is the budget vs. actual variance summary:\n{df.to_string()}\nWhat are the key insights and recommendations?"}
         ],
-        model="Llama 3.1 8B",
+        model="openai/gpt-oss-20b",
     )
 
     st.write(response.choices[0].message.content)
